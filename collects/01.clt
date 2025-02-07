@@ -1,0 +1,189 @@
+=== .\src\main.rs ===
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request, Response, Server};
+
+use systems::sys_plugin::PluginManager;
+
+use plugins::plugin_echo::EchoPlugin;
+
+pub mod plugins;
+pub mod structs;
+pub mod systems;
+
+//
+// Main server setup
+//
+#[tokio::main]
+async fn main() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+    let manager = apply_plugins().await;
+
+    // Create a service that passes the PluginManager to the request handler.
+    let make_svc = make_service_fn(move |_conn| {
+        let manager = manager.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req| {
+                let manager = manager.clone();
+                async move { handle_request(req, manager).await }
+            }))
+        }
+    });
+
+    let server = Server::bind(&addr).serve(make_svc);
+    
+    println!("Server running on http://{}", addr);
+    if let Err(e) = server.await {
+        eprintln!("Server error: {}", e);
+    }
+}
+
+//
+// Apply the Plugins
+//
+async fn apply_plugins() -> Arc<PluginManager> {
+    // Create and initialize PluginManager.
+    let mut manager = PluginManager::new();
+    manager.apply_plugin(Box::new(EchoPlugin::new()));
+    manager.init_plugins().await;
+    return Arc::new(manager);
+}
+
+//
+// Modified handle_request function that uses PluginManager.
+//
+async fn handle_request(
+    req: Request<Body>,
+    plugin_manager: Arc<PluginManager>,
+) -> Result<Response<Body>, Infallible> {
+    // Log method and URI.
+    println!("Received {} request for {}", req.method(), req.uri());
+    for (name, value) in req.headers().iter() {
+        println!("Header: {}: {:?}", name, value);
+    }
+
+    // Check if a plugin wants to handle the request.
+    if let Some(response) = plugin_manager.handle_request(req).await {
+        return Ok(response);
+    }
+
+    // Default response if no plugin handles the request.
+    Ok(Response::new(Body::from("No Plugin Found")))
+}
+
+=== .\src\plugins\mod.rs ===
+pub mod plugin_echo;
+
+=== .\src\plugins\plugin_echo\mod.rs ===
+use std::convert::Infallible;
+
+use async_trait::async_trait;
+use hyper::{Body, Request, Response};
+
+use crate::structs::struct_plugin::Plugin;
+
+
+//
+// Example Plugin: EchoPlugin
+//
+pub struct EchoPlugin;
+
+impl EchoPlugin {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[async_trait]
+impl Plugin for EchoPlugin {
+    async fn plugin_init(&mut self) {
+        println!("{} initialized", self.plugin_name());
+    }
+
+    fn plugin_name(&self) -> &str {
+        "EchoPlugin"
+    }
+
+    // This plugin handles requests where the path is "/echo"
+    fn plugin_can_handle(&self, req: &Request<Body>) -> bool {
+        req.uri().path() == "/echo"
+    }
+
+    async fn plugin_handle(&self, req: Request<Body>) -> Result<Response<Body>, Infallible> {
+        // For demonstration, echo back the request body.
+        let body_bytes = hyper::body::to_bytes(req.into_body()).await.unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        let response_body = format!("Echo: {}", body_text);
+        Ok(Response::new(Body::from(response_body)))
+    }
+}
+
+=== .\src\structs\mod.rs ===
+pub mod struct_plugin;
+
+=== .\src\structs\struct_plugin.rs ===
+use std::convert::Infallible;
+
+use async_trait::async_trait;
+use hyper::{Body, Request, Response};
+
+//
+// Plugin Trait
+//
+#[async_trait]
+pub trait Plugin: Send + Sync {
+    async fn plugin_init(&mut self);
+    fn plugin_name(&self) -> &str;
+    fn plugin_can_handle(&self, req: &Request<Body>) -> bool;
+    async fn plugin_handle(&self, req: Request<Body>) -> Result<Response<Body>, Infallible>;
+}
+
+=== .\src\systems\mod.rs ===
+pub mod sys_plugin;
+
+=== .\src\systems\sys_plugin.rs ===
+use hyper::{Body, Request, Response};
+
+use crate::structs::struct_plugin::Plugin;
+
+//
+// Plugin Manager
+//
+pub struct PluginManager {
+    plugins: Vec<Box<dyn Plugin>>,
+}
+
+impl PluginManager {
+    pub fn new() -> Self {
+        Self {
+            plugins: Vec::new(),
+        }
+    }
+
+    /// Add a plugin to the manager.
+    pub fn apply_plugin(&mut self, plugin: Box<dyn Plugin>) {
+        self.plugins.push(plugin);
+    }
+
+    /// Initialize all plugins (if needed).
+    pub async fn init_plugins(&mut self) {
+        for plugin in self.plugins.iter_mut() {
+            plugin.plugin_init().await;
+        }
+    }
+
+    /// Iterate over plugins to find one that can handle the request.
+    pub async fn handle_request(&self, req: Request<Body>) -> Option<Response<Body>> {
+        for plugin in self.plugins.iter() {
+            if plugin.plugin_can_handle(&req) {
+                return Some(plugin.plugin_handle(req).await.ok()?);
+            }
+        }
+        None
+    }
+}
+

@@ -1,0 +1,11 @@
+[package]
+name = "smn_web_hub"
+version = "0.1.0"
+edition = "2021"
+description = "A simple web server for the SMN project"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "0.14", features = ["server", "tcp", "http1"] }
+async-trait = "0.1"
